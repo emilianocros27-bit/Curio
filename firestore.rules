@@ -1,0 +1,114 @@
+rules_version = '2';
+
+// Reglas de seguridad de Sabio.
+//
+// Modelo: cada usuario anónimo tiene UN documento en users/{uid} con todo
+// su progreso (racha, XP, gemas, vidas, temas). No hay datos de otros
+// usuarios expuestos, no hay contenido generado por usuarios, no hay PII.
+//
+// Estas reglas hacen dos cosas:
+//   1. Aíslan por dueño: nadie lee ni escribe el documento de otro uid.
+//   2. Validan forma y rangos: un cliente modificado (app reversada, o un
+//      script que pega directo a la API REST con un token robado) no puede
+//      escribir un documento con campos inventados, tipos incorrectos, o
+//      valores absurdos (XP negativo, 500 vidas, un mapa "topics" gigante).
+//
+// Lo que esto NO cubre: un cliente modificado todavía puede, en una sola
+// escritura válida en forma, mentir sobre SU PROPIO progreso dentro de los
+// rangos permitidos (por ejemplo, marcar una racha como completada sin
+// haber jugado). Como no hay ranking público ni nada con valor monetario
+// todavía, ese riesgo es aceptable para este MVP. Si en el futuro se suma
+// un leaderboard social o cualquier cosa con valor real, esa lógica de
+// progreso tiene que validarse server-side (Cloud Functions / App Check),
+// no solo con reglas declarativas.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /users/{userId} {
+      allow read, delete: if isOwner(userId);
+      allow create, update: if isOwner(userId) && isValidProgress(request.resource.data);
+    }
+
+    // Curio: private anonymous profiles and immutable, bounded daily receipts.
+    match /curioUsers/{uid} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow create, update: if request.auth != null && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['version','profile'])
+        && request.resource.data.version == 1
+        && validCurioProfile(request.resource.data.profile);
+      allow delete: if request.auth != null && request.auth.uid == uid;
+      match /completions/{receipt} {
+        allow read: if request.auth != null && request.auth.uid == uid;
+        allow create: if request.auth != null && request.auth.uid == uid
+          && validCurioReceipt(request.resource.data, receipt);
+        allow update: if request.auth != null && request.auth.uid == uid
+          && request.resource.data == resource.data;
+        allow delete: if request.auth != null && request.auth.uid == uid;
+      }
+    }
+
+    // Todo lo demás, denegado por defecto.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
+
+function isOwner(userId) {
+  return request.auth != null && request.auth.uid == userId;
+}
+
+function isValidProgress(data) {
+  return data.keys().hasOnly(['globalStreak', 'lastActiveDate', 'totalXp', 'gems', 'hearts', 'topics'])
+    && data.globalStreak is int && data.globalStreak >= 0 && data.globalStreak <= 3650
+    && (data.lastActiveDate == null || (data.lastActiveDate is string && data.lastActiveDate.size() <= 10))
+    && data.totalXp is int && data.totalXp >= 0 && data.totalXp <= 1000000
+    && data.gems is int && data.gems >= 0 && data.gems <= 100000
+    && data.hearts is int && data.hearts >= 0 && data.hearts <= 5
+    && data.topics is map && data.topics.size() <= 12
+    && isValidTopicsMap(data.topics);
+}
+
+function isValidTopicsMap(topics) {
+  // Firestore rules no tienen forma nativa de iterar un mapa arbitrario y
+  // validar cada valor con una condición dinámica, así que este chequeo
+  // queda a nivel "es un mapa razonable" (tamaño acotado arriba). El tipo
+  // y los campos exactos de cada tema se validan del lado del cliente
+  // (TypeScript) antes de llegar acá.
+  return topics.size() >= 0;
+}
+
+function curioTopics() {
+ return ['egipto','grecia','roma','mesoamerica','revolucion-industrial','sistema-solar','cuerpo-humano','celulas','fisica','quimica','oceanos','mapas','montanas','clima','capitales','renacimiento','pintura','musica','literatura','cine','ecosistemas','animales','plantas','inventos','internet'];
+}
+function validCurioProfile(p) {
+ return p is map && p.keys().hasOnly(['name','avatar','interests','weeklyGoal','createdAt'])
+  && p.name is string && p.name.size() >= 2 && p.name.size() <= 24
+  && p.avatar is int && p.avatar >= 0 && p.avatar < 6
+  && p.interests is list && p.interests.size() >= 1 && p.interests.size() <= 25
+  && p.interests.toSet().size() == p.interests.size() && p.interests.hasOnly(curioTopics())
+  && p.weeklyGoal is int && p.weeklyGoal >= 1 && p.weeklyGoal <= 7
+  && p.createdAt is int && p.createdAt > 0 && p.createdAt <= request.time.toMillis() + 300000;
+}
+function curioIndex(i) { return i is int && i >= 0 && i < 7; }
+function curioAnswer(a) { return a is int && a >= 0 && a <= 2; }
+function curioCorrect(topic, i) { return i % 3 == 2 ? (i % 2 == 0 ? 0 : 1) : (i + topic.size()) % 3; }
+function curioPoint(d, i) { return d.answers[i] == curioCorrect(d.topicId,d.questions[i]) ? 1 : 0; }
+function curioMiss(d,i) { return curioPoint(d,i) == 0 ? [d.topicId + ':' + string(d.questions[i])] : []; }
+function validCurioReceipt(d,id) {
+ return d.keys().hasOnly(['id','topicId','lesson','day','completedAt','answers','questions','score','missed','kind'])
+  && d.topicId is string && (d.topicId in curioTopics() || d.topicId == 'general')
+  && d.kind in ['lesson','review'] && d.id == id && id == d.topicId + ':' + d.day + ':' + d.kind
+  && curioIndex(d.lesson)
+  && d.day is string && d.day.matches('^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$')
+  && d.day >= '2026-01-01' && d.day <= '2100-12-31'
+  && d.completedAt is int && d.completedAt > 0 && d.completedAt <= request.time.toMillis() + 300000
+  && d.questions is list && d.questions.size() == 3 && d.questions.toSet().size() == 3
+  && curioIndex(d.questions[0]) && curioIndex(d.questions[1]) && curioIndex(d.questions[2])
+  && (d.kind == 'review' || d.questions == [d.lesson, (d.lesson+6)%7, (d.lesson+5)%7])
+  && d.answers is list && d.answers.size() == 3
+  && curioAnswer(d.answers[0]) && curioAnswer(d.answers[1]) && curioAnswer(d.answers[2])
+  && d.score is int && d.score == curioPoint(d,0) + curioPoint(d,1) + curioPoint(d,2)
+  && d.missed is list && d.missed.size() == 3-d.score && d.missed.toSet().size() == d.missed.size()
+  && d.missed == curioMiss(d,0).concat(curioMiss(d,1)).concat(curioMiss(d,2));
+}
